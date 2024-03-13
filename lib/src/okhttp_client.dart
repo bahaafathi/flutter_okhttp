@@ -8,8 +8,15 @@ import 'package:jni/jni.dart';
 import 'jni/jni_bindings.dart';
 
 class OkhttpClient extends BaseClient {
+  bool _isClosed = false;
+
   @override
   Future<StreamedResponse> send(BaseRequest request) async {
+    if (_isClosed) {
+      throw ClientException(
+          'HTTP request failed. Client is already closed.', request.url);
+    }
+
     final receivePort = ReceivePort();
     final events = StreamQueue<dynamic>(receivePort);
 
@@ -18,12 +25,14 @@ class OkhttpClient extends BaseClient {
       method: request.method,
       headers: request.headers,
       body: await request.finalize().toBytes(),
-      sendPort: receivePort.sendPort
+      followRedirects: request.followRedirects,
+      sendPort: receivePort.sendPort,
     ));
 
     final statusCode = await events.next as int;
     final reasonPhrase = await events.next as String;
     final responseHeaders = await events.next as Map<String, String>;
+    final isRedirect = await events.next as bool;
 
     Stream<List<int>> responseBodyStream(Stream<dynamic> events) async* {
       try {
@@ -42,6 +51,7 @@ class OkhttpClient extends BaseClient {
     }
 
     return StreamedResponse(responseBodyStream(events.rest), statusCode,
+        isRedirect: isRedirect,
         contentLength: _contentLength(responseHeaders),
         request: request,
         headers: responseHeaders,
@@ -54,15 +64,20 @@ class OkhttpClient extends BaseClient {
         String method,
         Map<String, String> headers,
         Uint8List body,
+        bool followRedirects,
         SendPort sendPort
       }) args) {
-    final client = OkHttpClient();
+    final client = OkHttpClient()
+        .newBuilder()
+        .followRedirects(args.followRedirects)
+        .build();
+
     final builder = Request_Builder();
 
     builder.url1(args.url.toString().toJString());
 
     args.headers.forEach(
-        (key, value) => builder.addHeader(key.toJString(), value.toJString()));
+        (key, value) => builder.header(key.toJString(), value.toJString()));
 
     builder.method(
         args.method.toJString(), _initRequestBody(args.method, args.body));
@@ -72,6 +87,7 @@ class OkhttpClient extends BaseClient {
     args.sendPort.send(response.code());
     args.sendPort.send(response.message().toDartString(releaseOriginal: true));
     args.sendPort.send(_responseHeaders(response.headers1()));
+    args.sendPort.send(response.isRedirect());
 
     const bufferSize = 4 * 1024;
     final bytesArray = JArray(jbyte.type, bufferSize);
@@ -132,6 +148,12 @@ class OkhttpClient extends BaseClient {
     if (!_allowsRequestBody(method)) return RequestBody.fromRef(nullptr);
 
     return RequestBody.create2(MediaType.fromRef(nullptr), body.toJArray());
+  }
+
+  @override
+  void close() {
+    _isClosed = true;
+    super.close();
   }
 }
 
